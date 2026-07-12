@@ -1,0 +1,4 @@
+# Path to Android SDK
+# On Linux: typically ~/Android/Sdk
+# On macOS: typically ~/Library/Android/sdk
+sdk.dir=/home/mgt/Android/Sdk

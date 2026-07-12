@@ -1,0 +1,11 @@
+__pycache__/
+*.py[oc]
+.venv/
+build/
+dist/
+*.egg-info/
+*.apk
+*.keystore
+local.properties
+server.log
+__pycache__/
