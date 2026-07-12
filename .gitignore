@@ -1,11 +1,22 @@
+# Python
 __pycache__/
 *.py[oc]
 .venv/
 build/
 dist/
 *.egg-info/
+
+# Android/Gradle
 *.apk
 *.keystore
 local.properties
+.gradle/
+gradle/
+gradlew
+gradlew.bat
+app/build/
+*.iml
+
+# Logs
 server.log
-__pycache__/
+server.log.*
