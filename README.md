@@ -101,7 +101,7 @@ R1: 回到唤醒词检测状态
 └── README.md
 ```
 
-## R1 刷机
+## 连接 R1
 
 ### 硬件信息
 - SoC: Rockchip RK3229 (ARM Cortex-A7 quad @ 1.5GHz)
