@@ -124,26 +124,74 @@ async def ask_hermes(text: str, session_id: str = None) -> str:
         return "抱歉，连接出了点问题。"
 
 
+async def _tts_sentence_to_pcm(sentence: str) -> bytes:
+    """Synthesize one sentence to PCM via edge-tts stream() + ffmpeg.
+
+    Uses edge-tts's streaming API to collect MP3 chunks in memory,
+    then converts to 48kHz PCM with a single ffmpeg pipe.
+    No temp files — faster and fewer failure points.
+    """
+    import subprocess
+
+    communicate = edge_tts.Communicate(
+        text=sentence,
+        voice=config.TTS_VOICE,
+        rate=config.TTS_RATE,
+        volume=config.TTS_VOLUME,
+    )
+
+    # Collect MP3 bytes from edge-tts stream
+    mp3_chunks = []
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3_chunks.append(chunk["data"])
+
+    if not mp3_chunks:
+        return b""
+
+    mp3_data = b"".join(mp3_chunks)
+
+    # Convert MP3 → 48kHz 16-bit mono PCM via ffmpeg stdin pipe
+    proc = subprocess.run(
+        ["ffmpeg", "-i", "pipe:0",
+         "-f", "wav",
+         "-ar", str(config.OUTPUT_SAMPLE_RATE),
+         "-ac", "1",
+         "-acodec", "pcm_s16le",
+         "pipe:1", "-y"],
+        input=mp3_data,
+        capture_output=True,
+        timeout=30,
+    )
+
+    if proc.returncode != 0:
+        logger.error(f"ffmpeg error: {proc.stderr.decode()[:200]}")
+        return b""
+
+    # Extract PCM from WAV
+    import io as _io
+    with wave.open(_io.BytesIO(proc.stdout), "rb") as wf:
+        return wf.readframes(wf.getnframes())
+
+
 async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
     """Stream TTS: split text into sentences, generate and send each sentence's audio immediately.
 
-    This avoids the problem of generating a huge monolithic audio file for long responses.
-    Each sentence is synthesized independently and its PCM chunks are sent as they're ready.
+    Each sentence is synthesized independently via edge-tts streaming API.
+    PCM chunks are sent to the client as soon as each sentence is ready.
+    If a sentence fails, it is skipped — the pipeline continues with the next sentence.
 
     Args:
         text: text to synthesize
-        on_chunk: async callback(pcm_bytes) called for each PCM chunk as it's generated
+        on_chunk: async callback(pcm_bytes) called for each PCM chunk as it is generated
 
     Returns:
         Total bytes of PCM generated
     """
     import re
-    import tempfile
-    import os
-    import subprocess
 
-    # Split text into sentences at Chinese/English sentence-ending punctuation
-    # Don't split on decimal points (e.g., "29.5度") — only on 。！？\n followed by space or end
+    # Split text into sentences at Chinese sentence-ending punctuation
+    # Don't split on decimal points (e.g., "29.5度") — only on 。！？\n
     sentences = re.split(r'(?<=[。！？\n])\s*', text.strip())
     sentences = [s.strip() for s in sentences if s.strip()]
 
@@ -152,81 +200,40 @@ async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
         return 0
 
     total_pcm_bytes = 0
+    failed_count = 0
 
     for i, sentence in enumerate(sentences):
         logger.info(f"TTS sentence {i+1}/{len(sentences)}: {sentence[:50]}...")
 
-        communicate = edge_tts.Communicate(
-            text=sentence,
-            voice=config.TTS_VOICE,
-            rate=config.TTS_RATE,
-            volume=config.TTS_VOLUME,
-        )
-
-        # Retry on connection timeout
-        mp3_path = None
-        wav_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
-                mp3_path = mp3_file.name
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-                wav_path = wav_file.name
-
-            for attempt in range(3):
-                try:
-                    await communicate.save(mp3_path)
+        # Retry each sentence up to 3 times, but never let failure crash the pipeline
+        pcm_data = b""
+        for attempt in range(3):
+            try:
+                pcm_data = await _tts_sentence_to_pcm(sentence)
+                if pcm_data:
                     break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    logger.warning(f"TTS attempt {attempt+1} failed: {e}, retrying...")
+                logger.warning(f"TTS sentence {i+1} returned empty audio (attempt {attempt+1})")
+            except Exception as e:
+                logger.warning(f"TTS sentence {i+1} attempt {attempt+1} failed: {e}")
+                if attempt < 2:
                     await asyncio.sleep(1)
-                    communicate = edge_tts.Communicate(
-                        text=sentence,
-                        voice=config.TTS_VOICE,
-                        rate=config.TTS_RATE,
-                        volume=config.TTS_VOLUME,
-                    )
 
-            # Convert to 48kHz 16-bit mono WAV
-            proc = subprocess.run(
-                [
-                    "ffmpeg", "-i", mp3_path,
-                    "-f", "wav",
-                    "-ar", str(config.OUTPUT_SAMPLE_RATE),
-                    "-ac", "1",
-                    "-acodec", "pcm_s16le",
-                    wav_path, "-y"
-                ],
-                capture_output=True,
-                timeout=30,
-            )
+        if not pcm_data:
+            logger.error(f"TTS sentence {i+1} failed after 3 attempts, skipping: {sentence[:60]}")
+            failed_count += 1
+            continue
 
-            if proc.returncode != 0:
-                logger.error(f"ffmpeg error for sentence {i+1}: {proc.stderr.decode()}")
-                continue
+        total_pcm_bytes += len(pcm_data)
+        duration = len(pcm_data) / config.OUTPUT_SAMPLE_RATE / 2
+        logger.info(f"TTS sentence {i+1} done: {len(pcm_data)} bytes ({duration:.2f}s)")
 
-            # Read WAV, extract PCM
-            with wave.open(wav_path, "rb") as wf:
-                pcm_data = wf.readframes(wf.getnframes())
+        # Stream chunks to client immediately
+        if on_chunk:
+            for chunk in chunk_pcm(pcm_data):
+                await on_chunk(chunk)
 
-            total_pcm_bytes += len(pcm_data)
-            logger.info(f"TTS sentence {i+1} done: {len(pcm_data)} bytes ({len(pcm_data) / config.OUTPUT_SAMPLE_RATE / 2:.2f}s)")
-
-            # Stream chunks immediately
-            if on_chunk and pcm_data:
-                for chunk in chunk_pcm(pcm_data):
-                    await on_chunk(chunk)
-
-        finally:
-            for path in [mp3_path, wav_path]:
-                if path:
-                    try:
-                        os.unlink(path)
-                    except:
-                        pass
-
-    logger.info(f"TTS streaming complete: {len(sentences)} sentences, {total_pcm_bytes} bytes total ({total_pcm_bytes / config.OUTPUT_SAMPLE_RATE / 2:.2f}s)")
+    logger.info(f"TTS streaming complete: {len(sentences)} sentences, {total_pcm_bytes} bytes total "
+                f"({total_pcm_bytes / config.OUTPUT_SAMPLE_RATE / 2:.2f}s), {failed_count} failed")
     return total_pcm_bytes
 
 
@@ -282,18 +289,24 @@ async def run_pipeline(
         await on_status_sound("thinking")
 
     # Start a heartbeat task to keep WS alive during long operations
+    # (both thinking AND speaking phases — TTS generation can take 10-20s per
+    # sentence with retries, and R1 disconnects after ~30s of silence)
+    _current_phase = "thinking"
+
     async def heartbeat():
-        """Send periodic heartbeat to prevent WS timeout. Only active during thinking phase."""
+        """Send periodic heartbeat to prevent WS timeout.
+
+        Re-sends the current state every 3s. The client handles duplicate
+        state messages gracefully (idempotent updateState).
+        """
         while True:
             await asyncio.sleep(3)
             if on_state:
                 try:
-                    # Only send heartbeat if we're still in thinking phase
-                    # (don't send during speaking — TTS chunks themselves keep WS alive)
-                    await on_state("thinking")  # re-send state as heartbeat
+                    await on_state(_current_phase)
                 except Exception:
                     logger.warning("Heartbeat: WS send failed, stopping heartbeat")
-                    return  # Stop heartbeat if WS is broken
+                    return
 
     hb_task = asyncio.create_task(heartbeat())
 
@@ -326,14 +339,14 @@ async def run_pipeline(
             return (asr_text, "")
 
         # Phase 3: TTS (streaming — sentence by sentence)
-        # Cancel heartbeat before speaking — TTS chunks themselves keep WS alive
-        hb_task.cancel()
-        try:
-            await hb_task
-        except asyncio.CancelledError:
-            pass
+        # NOTE: Do NOT cancel heartbeat here. Even during speaking, TTS generation
+        # can take 10-20s per sentence (especially with edge-tts retries), and if
+        # the R1 client doesn't receive any data for ~30s it disconnects.
+        # The heartbeat keeps sending "speaking" state to keep the WS alive.
+        # TTS audio chunks are additional data that also keeps it alive.
 
         if on_state:
+            _current_phase = "speaking"
             await on_state("speaking")
         total_bytes = await synthesize_tts_stream(hermes_text, on_chunk=on_tts_chunk)
 

@@ -54,8 +54,17 @@ public class WakeWordDetector {
     private static final int FEATURE_BUFFER_MAX = 120;
     private static final int WAKEWORD_INPUT_FRAMES = 16;
 
-    // Detection threshold (lowered for loopback/mic testing)
-    private static final float DETECTION_THRESHOLD = 0.15f;
+    // Detection threshold — openWakeWord official default is 0.5
+    // (README: "trained to work well with a default threshold of 0.5")
+    private static final float DETECTION_THRESHOLD = 0.5f;
+    // Require N consecutive frames above threshold to confirm detection.
+    // Matches the official `patience` parameter — reduces false positives.
+    private static final int CONSECUTIVE_FRAMES_REQUIRED = 3;
+    private int consecutiveHits = 0;
+    // Cooldown after detection (in frames). Matches official `debounce_time`.
+    // 50 frames × 80ms = 4 seconds of silence after each detection.
+    private static final int COOLDOWN_FRAMES = 50;
+    private int cooldownCounter = 0;
 
     private final Context context;
     private WakeWordListener listener;
@@ -550,13 +559,37 @@ public class WakeWordDetector {
                         featureFlat[sOff], wkwOut[0][0], score, featureBufferSize, melspecBufferSize));
                 }
                 if (score > DETECTION_THRESHOLD) {
-                    Log.i(TAG, String.format("Wake word detected! score=%.3f", score));
-                    // Play wake sound (two high beeps) so user knows it was heard
-                    playWakeSound();
-                    if (listener != null) {
-                        listener.onWakeWordDetected();
+                    if (cooldownCounter > 0) {
+                        // Still in cooldown — ignore detection
+                        cooldownCounter--;
+                    } else {
+                        consecutiveHits++;
+                        if (consecutiveHits >= CONSECUTIVE_FRAMES_REQUIRED) {
+                            Log.i(TAG, String.format("Wake word detected! score=%.3f (consecutive=%d)",
+                                score, consecutiveHits));
+                            consecutiveHits = 0;
+                            cooldownCounter = COOLDOWN_FRAMES;
+                            // Play wake sound (two high beeps) so user knows it was heard
+                            playWakeSound();
+                            if (listener != null) {
+                                listener.onWakeWordDetected();
+                            }
+                            featureBufferSize = 0;
+                        } else {
+                            if (frameCount % 5 == 0) {
+                                Log.i(TAG, String.format("Pending: score=%.3f consecutive=%d/%d",
+                                    score, consecutiveHits, CONSECUTIVE_FRAMES_REQUIRED));
+                            }
+                        }
                     }
-                    featureBufferSize = 0;
+                } else {
+                    if (consecutiveHits > 0) {
+                        // Score dropped below threshold — reset
+                        consecutiveHits = 0;
+                    }
+                    if (cooldownCounter > 0) {
+                        cooldownCounter--;
+                    }
                 }
             }
         } catch (OrtException e) {

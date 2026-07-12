@@ -60,13 +60,19 @@ class ClientSession:
         self.hermes_session_id = None
         self.is_streaming_tts = False
 
-    async def send_state(self, state: str):
-        """Send state change to client and update internal state."""
+    async def send_state(self, state: str, quiet: bool = False):
+        """Send state change to client and update internal state.
+
+        Args:
+            state: the state to send
+            quiet: if True, don't log (used for heartbeat re-sends)
+        """
         self.state = state
         msg = json.dumps({"type": "state", "state": state})
         try:
             await self.ws.send(msg)
-            logger.info(f"→ state: {state}")
+            if not quiet:
+                logger.info(f"→ state: {state}")
         except Exception as e:
             logger.error(f"Failed to send state: {e}")
 
@@ -141,17 +147,26 @@ async def handle_binary(client: ClientSession, data: bytes):
                         logger.info(f"Played status sound: {name}")
 
                 # Run ASR → Hermes → TTS
-                await run_pipeline(
-                    pcm_data=pcm_data,
-                    session_id=client.hermes_session_id,
-                    on_state=client.send_state,
-                    on_tts_chunk=client.send_tts_chunk,
-                    on_asr_result=lambda text: client.send_json(
-                        {"type": "asr_result", "text": text}
-                    ),
-                    on_tts_done=on_tts_done,
-                    on_status_sound=on_status_sound,
-                )
+                try:
+                    await run_pipeline(
+                        pcm_data=pcm_data,
+                        session_id=client.hermes_session_id,
+                        on_state=client.send_state,
+                        on_tts_chunk=client.send_tts_chunk,
+                        on_asr_result=lambda text: client.send_json(
+                            {"type": "asr_result", "text": text}
+                        ),
+                        on_tts_done=on_tts_done,
+                        on_status_sound=on_status_sound,
+                    )
+                except Exception as e:
+                    logger.error(f"Pipeline crashed: {e}", exc_info=True)
+                    # Try to recover: send tts_done + go idle
+                    try:
+                        await client.send_json({"type": "tts_done"})
+                        await client.send_state(config.STATE_IDLE)
+                    except Exception:
+                        pass
             else:
                 logger.info("Audio too short, discarding")
                 client.audio_buffer.clear()
