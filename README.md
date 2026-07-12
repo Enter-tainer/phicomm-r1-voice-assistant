@@ -6,7 +6,7 @@
 
 斐讯 R1 是一个带 4-mic 阵列的蓝牙音箱，内置 Android 5.1 系统。本项目通过以下步骤将其改造为自定义语音助手：
 
-1. **破解刷机** — 获取 R1 的 root 权限 + ADB 调试
+1. **连接 ADB** — R1 出厂自带 ADB 调试，无需拆机或获取 root
 2. **Android App** — 在 R1 上运行的语音客户端（唤醒词检测 + 录音 + 播放）
 3. **Voice Server** — 在局域网服务器上运行的 WebSocket 后端（ASR + LLM + TTS）
 
@@ -110,34 +110,31 @@ R1: 回到唤醒词检测状态
 - Audio: 4-mic array, mono speaker
 - Network: WiFi 2.4GHz
 
-### 获取 Root + ADB
-1. 拆机，找到 PCB 上的 UART 焊点 (TX/RX/GND)
-2. 连接 USB-TTL 串口适配器，波特率 1500000
-3. 开机时按 Ctrl+C 进入 U-Boot
-4. 通过 U-Boot 修改 bootargs 添加 `androidboot.mode=charger`
-5. 进入充电模式后，通过 ADB sideload 推入 root 脚本
-6. 或者：使用已有的 root 刷机包（社区有提供）
+### 连接 ADB
 
-详细步骤参考社区帖子：
-- https://www.right.com.cn/forum/thread-334516-1-1.html
-- https://www.zhihu.com/column/c_1351680527230554112
+R1 出厂自带 ADB 调试，无需拆机或获取 root 权限。直接通过 WiFi 连接即可：
+
+1. 确保电脑和 R1 在同一局域网
+2. 获取 R1 的 IP 地址（在 R1 屏幕上查看，或路由器后台查看）
+3. 连接 ADB：`adb connect <R1_IP>:5555`
 
 ### 关键 ADB 命令
 ```bash
-# 连接 R1 (需要知道 IP)
+# 连接 R1
 adb connect 192.168.1.152:5555
 
 # 查看日志
 adb logcat -s VoiceService:V OpenWakeWord:V
 
-# 安装 APK
-adb install -r app-debug.apk
+# 安装 APK（注意：adb install 在 R1 上会挂起，需用 push + pm install）
+adb -s 192.168.1.152:5555 push app-debug.apk /data/local/tmp/r1voice.apk
+adb -s 192.168.1.152:5555 shell "pm install -r /data/local/tmp/r1voice.apk"
 
 # 杀掉 Phicomm 原生服务（防止音频冲突）
-adb shell su -c "pm disable com.phicomm.audio"
+adb -s 192.168.1.152:5555 shell am force-stop com.phicomm.speaker
 
 # 重启
-adb shell su -c "reboot"
+adb -s 192.168.1.152:5555 shell reboot
 ```
 
 ## 服务器端
@@ -213,8 +210,13 @@ cp local.properties.example local.properties
 ### 部署到 R1
 ```bash
 adb connect 192.168.1.152:5555
-adb install -r app/build/outputs/apk/debug/app-debug.apk
 
+# 注意：adb install 在 R1 (Android 5.1) 上会挂起，必须用 push + pm install
+adb -s 192.168.1.152:5555 push app/build/outputs/apk/debug/app-debug.apk /data/local/tmp/r1voice.apk
+adb -s 192.168.1.152:5555 shell "pm install -r /data/local/tmp/r1voice.apk"
+
+# 启动
+adb -s 192.168.1.152:5555 shell am start -n com.mgt.r1voice/.MainActivity
 # 启动后，在 R1 屏幕上输入服务器地址，点击"启动语音服务"
 ```
 
