@@ -12,12 +12,12 @@ import org.json.JSONObject;
 /**
  * VoiceService — foreground service managing the voice assistant lifecycle.
  *
- * State machine: IDLE → LISTENING → THINKING → SPEAKING → IDLE
+ * Server-side wake word detection. R1 is a dumb audio device:
+ * - Continuously streams 16kHz PCM to server via WebSocket
+ * - Receives TTS PCM + state updates from server
  *
- * IDLE:       Local openWakeWord listening for wake word (on-device TFLite)
- * LISTENING:  Recording audio, streaming to server for ASR
- * THINKING:   Server processing ASR + Hermes
- * SPEAKING:   Receiving TTS audio from server, playing via AudioPlayer
+ * State machine is managed entirely by the server.
+ * R1 just needs to know when to mute its mic (during TTS playback).
  */
 public class VoiceService extends Service {
 
@@ -29,15 +29,13 @@ public class VoiceService extends Service {
     private WsClient wsClient;
     private AudioRecorder audioRecorder;
     private AudioPlayer audioPlayer;
-    private WakeWordDetector wakeWordDetector;
 
     private String serverAddr;
     private boolean isRunning = false;
 
-    private static final String STATE_IDLE = "idle";
-    private static final String STATE_LISTENING = "listening";
-    private static final String STATE_THINKING = "thinking";
-    private static final String STATE_SPEAKING = "speaking";
+    // Whether we should be streaming mic audio to server
+    // Stop during TTS playback to avoid echo
+    private boolean shouldStreamMic = true;
 
     @Override
     public void onCreate() {
@@ -66,7 +64,7 @@ public class VoiceService extends Service {
     private void startForeground() {
         Notification notification = new Notification.Builder(this)
                 .setContentTitle("R1 语音助手")
-                .setContentText("本地唤醒词运行中...")
+                .setContentText("服务端唤醒词运行中...")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setOngoing(true)
                 .build();
@@ -83,8 +81,9 @@ public class VoiceService extends Service {
             @Override
             public void onConnected() {
                 Log.i(TAG, "WS connected");
-                updateState(STATE_IDLE);
-                startWakeWordDetection();
+                updateState("idle");
+                // Start streaming mic audio immediately
+                startRecording();
             }
 
             @Override
@@ -102,6 +101,7 @@ public class VoiceService extends Service {
 
             @Override
             public void onBinaryMessage(byte[] data) {
+                // Binary data = TTS PCM chunk
                 if (!audioPlayer.isPlaying()) {
                     audioPlayer.start();
                 }
@@ -121,20 +121,19 @@ public class VoiceService extends Service {
                 case "state":
                     String state = json.optString("state");
                     updateState(state);
+                    // Stop mic streaming during speaking to avoid echo
+                    if ("speaking".equals(state)) {
+                        shouldStreamMic = false;
+                    } else if ("idle".equals(state)) {
+                        shouldStreamMic = true;
+                    }
                     break;
 
                 case "tts_done":
                     Log.i(TAG, "TTS done, stopping playback");
                     audioPlayer.stop();
-                    // Back to idle — stop recording and resume wake word detection
-                    stopRecording();
-                    updateState(STATE_IDLE);
-                    // Resume existing wake word detector (AudioRecord is still alive)
-                    if (wakeWordDetector != null) {
-                        wakeWordDetector.resumeDetection();
-                    } else {
-                        startWakeWordDetection();
-                    }
+                    shouldStreamMic = true;
+                    updateState("idle");
                     break;
 
                 case "asr_result":
@@ -155,16 +154,16 @@ public class VoiceService extends Service {
         Log.i(TAG, "State → " + state);
 
         switch (state) {
-            case STATE_IDLE:
+            case "idle":
                 LedController.setColor(LedController.COLOR_IDLE);
                 break;
-            case STATE_LISTENING:
+            case "listening":
                 LedController.setColor(LedController.COLOR_LISTENING);
                 break;
-            case STATE_THINKING:
+            case "thinking":
                 LedController.setColor(LedController.COLOR_THINKING);
                 break;
-            case STATE_SPEAKING:
+            case "speaking":
                 LedController.setColor(LedController.COLOR_SPEAKING);
                 break;
             default:
@@ -172,57 +171,7 @@ public class VoiceService extends Service {
         }
     }
 
-    // === Local Wake Word Detection (openWakeWord) ===
-
-    private void startWakeWordDetection() {
-        if (wakeWordDetector != null && wakeWordDetector.isRunning()) return;
-
-        Log.i(TAG, "Starting local wake word detection (openWakeWord)");
-        wakeWordDetector = new WakeWordDetector(this, new WakeWordDetector.WakeWordListener() {
-            @Override
-            public void onWakeWordDetected() {
-                Log.i(TAG, "Wake word detected locally!");
-                
-                // Pause detection loop but keep AudioRecord alive
-                // (releasing + creating new AudioRecord causes AudioFlinger deadlock on R1)
-                if (wakeWordDetector != null) {
-                    wakeWordDetector.pauseDetection();
-                }
-
-                // Delay recording start so the wake beep finishes first
-                // (beep is ~350ms, wait 500ms to be safe)
-                new Thread(() -> {
-                    try { Thread.sleep(500); } catch (InterruptedException e) { return; }
-                    
-                    // Notify server to enter listening state
-                    if (wsClient != null && wsClient.isConnected()) {
-                        try {
-                            JSONObject msg = new JSONObject();
-                            msg.put("type", "wake");
-                            wsClient.sendText(msg.toString());
-                        } catch (JSONException e) {
-                            Log.e(TAG, "Error sending wake", e);
-                        }
-                    }
-
-                    // Switch to listening — start recording using the SAME AudioRecord
-                    updateState(STATE_LISTENING);
-                    startRecording();
-                }).start();
-            }
-        });
-
-        wakeWordDetector.start();
-    }
-
-    private void stopWakeWordDetection() {
-        if (wakeWordDetector != null) {
-            wakeWordDetector.stop();
-            wakeWordDetector = null;
-        }
-    }
-
-    // === Audio Recording (after wake word) ===
+    // === Audio Recording (continuous streaming) ===
 
     private void startRecording() {
         if (audioRecorder != null && audioRecorder.isRecording()) return;
@@ -230,18 +179,15 @@ public class VoiceService extends Service {
         audioRecorder = new AudioRecorder(new AudioRecorder.AudioFrameCallback() {
             @Override
             public void onAudioFrame(byte[] data) {
-                if (wsClient != null && wsClient.isConnected()) {
+                // Only stream mic when we're not playing TTS
+                if (shouldStreamMic && wsClient != null && wsClient.isConnected()) {
                     wsClient.sendBinary(data);
                 }
             }
         });
 
-        // Reuse AudioRecord from WakeWordDetector to avoid AudioFlinger deadlock
-        if (wakeWordDetector != null && wakeWordDetector.getAudioRecord() != null) {
-            audioRecorder.startWithExistingRecord(wakeWordDetector.getAudioRecord());
-        } else {
-            audioRecorder.start();
-        }
+        audioRecorder.start();
+        Log.i(TAG, "Mic streaming started");
     }
 
     private void stopRecording() {
@@ -263,7 +209,6 @@ public class VoiceService extends Service {
     public void onDestroy() {
         Log.i(TAG, "VoiceService destroyed");
         isRunning = false;
-        stopWakeWordDetection();
         stopRecording();
         stopPlayback();
         if (wsClient != null) {

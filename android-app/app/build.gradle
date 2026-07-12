@@ -10,8 +10,8 @@ android {
         applicationId "com.mgt.r1voice"
         minSdk 21
         targetSdk 22
-        versionCode 12
-        versionName "12.0"
+        versionCode 14
+        versionName "14.0"
         ndk {
             abiFilters 'armeabi-v7a'
         }

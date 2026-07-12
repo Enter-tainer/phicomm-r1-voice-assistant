@@ -21,9 +21,10 @@ public class AudioRecorder {
     private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO;
     private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
 
-    // Frame size: 20ms = 320 samples * 2 bytes = 640 bytes
-    private static final int FRAME_SIZE_MS = 20;
-    private static final int FRAME_SIZE = SAMPLE_RATE * FRAME_SIZE_MS / 1000 * 2; // 640 bytes
+    // Frame size: 80ms = 1280 samples * 2 bytes = 2560 bytes
+    // Matches openWakeWord's expected input size for optimal detection
+    private static final int FRAME_SIZE_MS = 80;
+    private static final int FRAME_SIZE = SAMPLE_RATE * FRAME_SIZE_MS / 1000 * 2; // 2560 bytes
 
     private AudioRecord audioRecord;
     private boolean isRecording = false;
@@ -85,7 +86,7 @@ public class AudioRecorder {
 
         try {
             audioRecord = new AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 SAMPLE_RATE,
                 CHANNEL_CONFIG,
                 AUDIO_FORMAT,

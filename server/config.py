@@ -50,6 +50,14 @@ OUTPUT_CHANNELS = 1
 OUTPUT_CHUNK_MS = 20  # 20ms chunks for streaming
 OUTPUT_CHUNK_BYTES = OUTPUT_SAMPLE_RATE * OUTPUT_SAMPLE_SIZE * OUTPUT_CHANNELS * OUTPUT_CHUNK_MS // 1000  # 1920 bytes
 
+# Wake word (openWakeWord, server-side)
+WAKE_WORD_MODEL = "hey_jarvis"
+WAKE_WORD_THRESHOLD = 0.3
+
+# Mic gain — R1 microphone sensitivity is very low (raw audio ~100-200 when speaking)
+# Apply gain to bring it to normal levels (~3000-10000)
+MIC_GAIN = 30.0
+
 # VAD (Silero)
 VAD_ENERGY_THRESHOLD = 0.3  # Silero speech probability threshold
 VAD_SILENCE_FRAMES = 25  # frames of silence to end speech

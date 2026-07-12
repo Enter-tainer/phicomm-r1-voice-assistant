@@ -102,8 +102,9 @@ public class WakeWordDetector {
     private float[] rawAudioBuffer = new float[MELSPEC_MAX_FRAMES * FRAME_SAMPLES + MELSPEC_CONTEXT];
     private int rawAudioSize = 0;
 
-    // Fixed gain — R1 mic sensitivity is very low, need ~30x boost
-    private static final float FIXED_GAIN = 30.0f;
+    // No gain — official openWakeWord uses raw int16 audio directly.
+    // Applying gain causes severe clipping which destroys melspec features.
+    private static final float FIXED_GAIN = 1.0f;
 
     public interface WakeWordListener {
         void onWakeWordDetected();
