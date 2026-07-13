@@ -81,10 +81,14 @@ public class AudioRecorder {
     public boolean start() {
         if (isRecording) return true;
 
+        Log.i(TAG, "start() called, creating AudioRecord...");
         int minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT);
+        Log.i(TAG, "getMinBufferSize=" + minBuffer);
         int bufferSize = Math.max(minBuffer, FRAME_SIZE * 4);
+        Log.i(TAG, "bufferSize=" + bufferSize + " FRAME_SIZE=" + FRAME_SIZE);
 
         try {
+            Log.i(TAG, "Creating AudioRecord (VOICE_RECOGNITION, 16kHz, mono, 16bit)...");
             audioRecord = new AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 SAMPLE_RATE,
@@ -92,6 +96,7 @@ public class AudioRecorder {
                 AUDIO_FORMAT,
                 bufferSize
             );
+            Log.i(TAG, "AudioRecord created, state=" + audioRecord.getState());
         } catch (Exception e) {
             Log.e(TAG, "Failed to create AudioRecord", e);
             return false;
@@ -112,14 +117,29 @@ public class AudioRecorder {
             @Override
             public void run() {
                 byte[] buffer = new byte[FRAME_SIZE];
+                int readErrors = 0;
+                int totalFrames = 0;
+                Log.i(TAG, "Record thread started, FRAME_SIZE=" + FRAME_SIZE);
                 while (isRecording) {
                     int read = audioRecord.read(buffer, 0, FRAME_SIZE);
-                    if (read > 0 && callback != null) {
-                        byte[] frame = new byte[read];
-                        System.arraycopy(buffer, 0, frame, 0, read);
-                        callback.onAudioFrame(frame);
+                    if (read > 0) {
+                        totalFrames++;
+                        if (totalFrames <= 3 || totalFrames % 250 == 0) {
+                            Log.i(TAG, "read OK: frame=" + totalFrames + " bytes=" + read);
+                        }
+                        if (callback != null) {
+                            byte[] frame = new byte[read];
+                            System.arraycopy(buffer, 0, frame, 0, read);
+                            callback.onAudioFrame(frame);
+                        }
+                    } else {
+                        readErrors++;
+                        Log.e(TAG, "read returned " + read + " (errors=" + readErrors + ")");
+                        if (readErrors > 10) break;
+                        try { Thread.sleep(10); } catch (InterruptedException e) { break; }
                     }
                 }
+                Log.i(TAG, "Record thread ended, totalFrames=" + totalFrames + " errors=" + readErrors);
             }
         }, "AudioRecorder-Thread");
         recordThread.start();

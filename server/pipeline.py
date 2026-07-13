@@ -100,6 +100,7 @@ async def ask_hermes(text: str, session_id: str = None) -> str:
     extra_headers = {}
     if session_id:
         extra_headers["X-Hermes-Session-Id"] = session_id
+        logger.info(f"Hermes session: {session_id}")
 
     headers.update(extra_headers)
 
@@ -203,6 +204,8 @@ async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
     failed_count = 0
 
     for i, sentence in enumerate(sentences):
+        # If on_chunk's WS is dead, stop generating
+        # (checked via on_chunk returning False or raising)
         logger.info(f"TTS sentence {i+1}/{len(sentences)}: {sentence[:50]}...")
 
         # Retry each sentence up to 3 times, but never let failure crash the pipeline
@@ -265,6 +268,7 @@ async def run_pipeline(
     on_asr_result=None,
     on_tts_done=None,
     on_status_sound=None,
+    is_alive=None,
 ):
     """Run the full pipeline: ASR → Hermes → TTS.
 
@@ -274,10 +278,13 @@ async def run_pipeline(
         on_state: async callback(state_str) for state changes
         on_tts_chunk: async callback(pcm_bytes) for TTS audio chunks
         on_asr_result: async callback(text_str) for ASR result
+        is_alive: callable() returning bool — if False, WS is dead, abort early
 
     Returns:
         (asr_text, hermes_text) tuple
     """
+    def alive():
+        return is_alive() if is_alive else True
     import asyncio
 
     # Phase 1: ASR
@@ -288,30 +295,35 @@ async def run_pipeline(
     if on_status_sound:
         await on_status_sound("thinking")
 
-    # Start a heartbeat task to keep WS alive during long operations
-    # (both thinking AND speaking phases — TTS generation can take 10-20s per
-    # sentence with retries, and R1 disconnects after ~30s of silence)
     _current_phase = "thinking"
 
     async def heartbeat():
-        """Send periodic heartbeat to prevent WS timeout.
-
-        Re-sends the current state every 3s. The client handles duplicate
-        state messages gracefully (idempotent updateState).
-        """
+        """Send periodic heartbeat to prevent WS timeout."""
         while True:
             await asyncio.sleep(3)
+            if not alive():
+                logger.warning("Heartbeat: WS dead, stopping")
+                return
             if on_state:
                 try:
-                    await on_state(_current_phase)
+                    await on_state(_current_phase, quiet=True)
                 except Exception:
-                    logger.warning("Heartbeat: WS send failed, stopping heartbeat")
+                    logger.warning("Heartbeat: WS send failed, stopping")
                     return
 
     hb_task = asyncio.create_task(heartbeat())
 
     try:
+        # Check WS alive before each expensive phase
+        if not alive():
+            logger.warning("WS dead before ASR, aborting pipeline")
+            return ("", "")
+
         asr_text = await transcribe_audio(pcm_data)
+
+        if not alive():
+            logger.warning("WS dead after ASR, aborting pipeline")
+            return (asr_text, "")
 
         if not asr_text:
             logger.info("ASR returned empty text, going back to idle")
@@ -327,6 +339,10 @@ async def run_pipeline(
             await on_asr_result(asr_text)
 
         # Phase 2: Hermes
+        if not alive():
+            logger.warning("WS dead before Hermes, aborting pipeline")
+            return (asr_text, "")
+
         hermes_text = await ask_hermes(asr_text, session_id)
 
         if not hermes_text:

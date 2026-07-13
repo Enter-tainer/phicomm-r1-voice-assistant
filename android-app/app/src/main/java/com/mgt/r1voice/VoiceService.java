@@ -174,11 +174,20 @@ public class VoiceService extends Service {
     // === Audio Recording (continuous streaming) ===
 
     private void startRecording() {
-        if (audioRecorder != null && audioRecorder.isRecording()) return;
+        Log.i(TAG, "startRecording() called");
+        if (audioRecorder != null && audioRecorder.isRecording()) {
+            Log.i(TAG, "startRecording: already recording, skip");
+            return;
+        }
 
         audioRecorder = new AudioRecorder(new AudioRecorder.AudioFrameCallback() {
+            private int frameCount = 0;
             @Override
             public void onAudioFrame(byte[] data) {
+                frameCount++;
+                if (frameCount <= 3 || frameCount % 250 == 0) {
+                    Log.i(TAG, "onAudioFrame #" + frameCount + " len=" + data.length + " shouldStream=" + shouldStreamMic + " wsConnected=" + (wsClient != null && wsClient.isConnected()));
+                }
                 // Only stream mic when we're not playing TTS
                 if (shouldStreamMic && wsClient != null && wsClient.isConnected()) {
                     wsClient.sendBinary(data);

@@ -117,6 +117,8 @@ public class WsClient {
     public void sendBinary(byte[] data) {
         if (ws != null && ws.isOpen()) {
             ws.send(data);
+        } else {
+            Log.w(TAG, "sendBinary: ws not open! ws=" + (ws != null) + " open=" + (ws != null && ws.isOpen()));
         }
     }
 

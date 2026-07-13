@@ -58,6 +58,8 @@ logging.basicConfig(
 logger = logging.getLogger("r1voice.server")
 
 
+import uuid
+
 class ClientSession:
     """Per-client state."""
 
@@ -67,14 +69,18 @@ class ClientSession:
         self.vad = SileroVAD()
         self.wake_word = WakeWordDetector()
         self.audio_buffer = bytearray()
-        self.hermes_session_id = None
+        self.hermes_session_id = f"r1-voice-{uuid.uuid4().hex[:12]}"
         self.is_streaming_tts = False
         self.last_wake_score = 0.0
         self.wake_score_log = []
+        self.ws_alive = True
+        self.pipeline_task = None
 
     async def send_state(self, state: str, quiet: bool = False):
         """Send state change to client and update internal state."""
         self.state = state
+        if not self.ws_alive:
+            return
         msg = json.dumps({"type": "state", "state": state})
         try:
             await self.ws.send(msg)
@@ -82,29 +88,36 @@ class ClientSession:
                 logger.info(f"→ state: {state}")
         except Exception as e:
             logger.error(f"Failed to send state: {e}")
+            self.ws_alive = False
 
     async def send_tts_chunk(self, pcm: bytes):
         """Send a PCM chunk to client."""
+        if not self.ws_alive:
+            return
         try:
             await self.ws.send(pcm)
         except Exception as e:
             logger.error(f"Failed to send TTS chunk: {e}")
+            self.ws_alive = False
 
     async def send_json(self, data: dict):
         """Send JSON message to client."""
+        if not self.ws_alive:
+            return
         try:
             await self.ws.send(json.dumps(data))
         except Exception as e:
             logger.error(f"Failed to send JSON: {e}")
+            self.ws_alive = False
 
 
 async def handle_binary(client: ClientSession, data: bytes):
-    """Handle incoming PCM audio from R1.
-
-    R1 streams audio continuously. In IDLE state we feed it to openWakeWord.
-    In LISTENING state we feed it to VAD.
-    In SPEAKING state we ignore it (no barge-in for now).
-    """
+    """Handle incoming PCM audio from R1."""
+    if not hasattr(client, '_frame_count'):
+        client._frame_count = 0
+    client._frame_count += 1
+    if client._frame_count <= 3 or client._frame_count % 250 == 0:
+        logger.info(f"handle_binary: frame={client._frame_count} state={client.state} bytes={len(data)}")
     if client.state == config.STATE_IDLE:
         # Feed audio to openWakeWord
         # R1 mic sensitivity is very low — apply gain before prediction
@@ -113,23 +126,6 @@ async def handle_binary(client: ClientSession, data: bytes):
 
         score = client.wake_word.predict(samples)
         client.last_wake_score = score
-
-        # Save continuous audio for debugging (first 10 seconds = 500 frames)
-        if not hasattr(client, '_debug_audio'):
-            client._debug_audio = bytearray()
-        if len(client._debug_audio) < 640 * 500:  # 10 seconds
-            client._debug_audio.extend(data)
-            if len(client._debug_audio) >= 640 * 500:
-                import wave
-                try:
-                    with wave.open("/tmp/r1_mic_continuous.wav", "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(16000)
-                        wf.writeframes(bytes(client._debug_audio))
-                    logger.info(f"Saved 10s debug audio: /tmp/r1_mic_continuous.wav ({len(client._debug_audio)} bytes)")
-                except Exception as e:
-                    logger.warning(f"Failed to save debug audio: {e}")
 
         # Log every frame with non-zero score or high audio
         audio_max = int(np.max(np.abs(samples))) if len(samples) > 0 else 0
@@ -157,13 +153,12 @@ async def handle_binary(client: ClientSession, data: bytes):
                 logger.info("Played wake beep")
 
                 # Wait for beep to finish playing on device before starting VAD.
-                # Without this, the mic picks up the beep echo and VAD false-triggers.
                 beep_duration = len(pcm) / (
                     config.OUTPUT_SAMPLE_RATE
                     * config.OUTPUT_SAMPLE_SIZE
                     * config.OUTPUT_CHANNELS
                 )
-                await asyncio.sleep(beep_duration + 0.15)  # beep duration + 150ms buffer
+                await asyncio.sleep(beep_duration + 0.15)
                 logger.info(f"Waited {beep_duration:.3f}s + 150ms for beep, starting VAD")
 
             # Switch to listening
@@ -219,25 +214,37 @@ async def handle_binary(client: ClientSession, data: bytes):
                             await client.send_tts_chunk(chunk)
                         logger.info(f"Played status sound: {name}")
 
-                try:
-                    await run_pipeline(
-                        pcm_data=pcm_data,
-                        session_id=client.hermes_session_id,
-                        on_state=client.send_state,
-                        on_tts_chunk=client.send_tts_chunk,
-                        on_asr_result=lambda text: client.send_json(
-                            {"type": "asr_result", "text": text}
-                        ),
-                        on_tts_done=on_tts_done,
-                        on_status_sound=on_status_sound,
-                    )
-                except Exception as e:
-                    logger.error(f"Pipeline crashed: {e}", exc_info=True)
+                # Launch pipeline as a background task so the message loop
+                # keeps consuming audio frames (discarded during THINKING/SPEAKING).
+                # This prevents the WebSocket internal queue from filling up and
+                # killing the connection during long ASR/LLM/TTS operations.
+                async def run_pipeline_safe():
                     try:
-                        await client.send_json({"type": "tts_done"})
-                        await client.send_state(config.STATE_IDLE)
-                    except Exception:
-                        pass
+                        await run_pipeline(
+                            pcm_data=pcm_data,
+                            session_id=client.hermes_session_id,
+                            on_state=client.send_state,
+                            on_tts_chunk=client.send_tts_chunk,
+                            on_asr_result=lambda text: client.send_json(
+                                {"type": "asr_result", "text": text}
+                            ),
+                            on_tts_done=on_tts_done,
+                            on_status_sound=on_status_sound,
+                            is_alive=lambda: client.ws_alive,
+                        )
+                    except Exception as e:
+                        logger.error(f"Pipeline crashed: {e}", exc_info=True)
+                        try:
+                            await client.send_json({"type": "tts_done"})
+                            await client.send_state(config.STATE_IDLE)
+                        except Exception:
+                            pass
+                    finally:
+                        client.pipeline_task = None
+
+                client.pipeline_task = asyncio.create_task(run_pipeline_safe())
+                logger.info("Pipeline launched as background task")
+
             else:
                 logger.info("Audio too short, discarding")
                 client.audio_buffer.clear()
@@ -250,11 +257,11 @@ async def handle_binary(client: ClientSession, data: bytes):
                 await client.send_state(config.STATE_IDLE)
 
     elif client.state == config.STATE_SPEAKING:
-        # Ignore audio while speaking (no barge-in)
+        # Consume and discard audio while speaking (keeps WS message queue drained)
         pass
 
     elif client.state == config.STATE_THINKING:
-        # Ignore audio while thinking
+        # Consume and discard audio while thinking (keeps WS message queue drained)
         pass
 
 
@@ -286,18 +293,36 @@ async def handle_client(websocket):
     logger.info(f"Client connected: {remote}")
 
     client = ClientSession(websocket)
+    logger.info(f"Session ID: {client.hermes_session_id}")
     await client.send_state(config.STATE_IDLE)
 
     try:
+        logger.info(f"DEBUG: entering message loop for {remote}")
+        msg_count = 0
         async for message in websocket:
+            msg_count += 1
+            if msg_count <= 3:
+                logger.info(f"DEBUG: received message #{msg_count}, type={type(message).__name__}, len={len(message) if isinstance(message, (bytes, str)) else 'N/A'}")
             if isinstance(message, bytes):
                 await handle_binary(client, message)
             elif isinstance(message, str):
+                logger.info(f"Received text message: {message[:100]}")
                 await handle_text(client, message)
+            else:
+                logger.warning(f"Unknown message type: {type(message)}")
+        logger.info(f"DEBUG: message loop ended after {msg_count} messages")
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"Client disconnected: {remote}")
     except Exception as e:
         logger.error(f"Client handler error: {e}", exc_info=True)
+    finally:
+        # Cancel any running pipeline when client disconnects
+        if client.pipeline_task and not client.pipeline_task.done():
+            client.pipeline_task.cancel()
+            try:
+                await client.pipeline_task
+            except asyncio.CancelledError:
+                pass
 
 
 async def main():
