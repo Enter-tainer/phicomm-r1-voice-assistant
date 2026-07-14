@@ -96,4 +96,4 @@ class SileroVAD:
         self.vad.reset_states()
         self._buffer = np.array([], dtype=np.float32)
         self._in_speech = False
-        self._grace_frames = 25  # Skip first ~500ms after wake (25 × 20ms frames)
+        self._grace_frames = 3   # Skip ~240ms after wake to avoid beep echo (was 25 = 2s — way too long)
