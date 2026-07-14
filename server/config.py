@@ -52,7 +52,7 @@ OUTPUT_CHUNK_BYTES = OUTPUT_SAMPLE_RATE * OUTPUT_SAMPLE_SIZE * OUTPUT_CHANNELS *
 
 # Wake word (openWakeWord, server-side)
 WAKE_WORD_MODEL = "hey_jarvis"
-WAKE_WORD_THRESHOLD = 0.4  # R1 mic peaks at 0.3-0.4 for "Hey Jarvis" (tried 0.5 — unreachable most of the time; 0.3 — too many false triggers)
+WAKE_WORD_THRESHOLD = 0.8  # Normal "Hey Jarvis" scores ~0.96; lower scores = software issue (crash/deadlock), not missed wake word
 
 # Mic gain — R1 microphone sensitivity is very low (raw audio ~100-200 when speaking)
 # Apply gain to bring it to normal levels (~3000-10000)
