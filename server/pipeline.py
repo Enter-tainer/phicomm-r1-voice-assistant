@@ -110,7 +110,7 @@ async def ask_hermes(text: str, session_id: str = None) -> str:
                 f"{config.HERMES_BASE}/chat/completions",
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -162,7 +162,7 @@ async def _tts_sentence_to_pcm(sentence: str) -> bytes:
          "pipe:1", "-y"],
         input=mp3_data,
         capture_output=True,
-        timeout=30,
+        timeout=15,
     )
 
     if proc.returncode != 0:
@@ -208,9 +208,9 @@ async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
         # (checked via on_chunk returning False or raising)
         logger.info(f"TTS sentence {i+1}/{len(sentences)}: {sentence[:50]}...")
 
-        # Retry each sentence up to 3 times, but never let failure crash the pipeline
+        # Retry each sentence up to 2 times, but never let failure crash the pipeline
         pcm_data = b""
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 pcm_data = await _tts_sentence_to_pcm(sentence)
                 if pcm_data:
@@ -218,11 +218,11 @@ async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
                 logger.warning(f"TTS sentence {i+1} returned empty audio (attempt {attempt+1})")
             except Exception as e:
                 logger.warning(f"TTS sentence {i+1} attempt {attempt+1} failed: {e}")
-                if attempt < 2:
+                if attempt < 1:
                     await asyncio.sleep(1)
 
         if not pcm_data:
-            logger.error(f"TTS sentence {i+1} failed after 3 attempts, skipping: {sentence[:60]}")
+            logger.error(f"TTS sentence {i+1} failed after 2 attempts, skipping: {sentence[:60]}")
             failed_count += 1
             continue
 
