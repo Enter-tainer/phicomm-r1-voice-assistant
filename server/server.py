@@ -120,15 +120,17 @@ async def handle_binary(client: ClientSession, data: bytes):
         logger.info(f"handle_binary: frame={client._frame_count} state={client.state} bytes={len(data)}")
     if client.state == config.STATE_IDLE:
         # Feed audio to openWakeWord
-        # Proper normalization: int16 [-32768,32767] → float32 [-1,1], then apply mic gain
-        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-        samples = np.clip(samples * config.MIC_GAIN, -1.0, 1.0)
+        # R1 mic sensitivity is very low — apply gain before prediction
+        # openWakeWord internally normalizes int16 to [-1,1]; passing float32
+        # in int16 range so the gain actually takes effect without clipping.
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        samples = np.clip(samples * config.MIC_GAIN, -32768, 32767)
 
         score = client.wake_word.predict(samples)
         client.last_wake_score = score
 
         # Log every frame with non-zero score or high audio
-        audio_max = int(np.max(np.abs(samples)) * 32768) if len(samples) > 0 else 0
+        audio_max = int(np.max(np.abs(samples))) if len(samples) > 0 else 0
         if score > 0.001 or (audio_max > 5000 and client.wake_word.prediction_count % 50 == 0):
             logger.info(f"Wake word: score={score:.6f} audio_max={audio_max} frame={client.wake_word.prediction_count}")
 
