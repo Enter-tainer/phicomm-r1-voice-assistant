@@ -36,7 +36,7 @@ class SileroVAD:
             model,
             threshold=self.threshold,
             sampling_rate=16000,
-            min_silence_duration_ms=1500,  # 1.5s silence to end speech (was 500ms — too aggressive)
+            min_silence_duration_ms=800,   # 0.8s silence to end speech (was 1500ms — users felt too long)
             speech_pad_ms=30,
         )
         logger.info("Silero VAD initialized (PyTorch JIT)")
