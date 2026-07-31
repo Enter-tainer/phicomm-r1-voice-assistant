@@ -96,12 +96,16 @@ Server: 回到唤醒词检测状态
 ```
 ├── server/                    # Python WebSocket 语音服务器
 │   ├── server.py              #   WebSocket 服务器 + 状态机 + 音频路由
+│   ├── r1_watchdog.py         #   自愈 watchdog (检测死锁 → 自动恢复 R1)
 │   ├── pipeline.py            #   ASR → LLM → TTS 流水线 + 心跳保活
 │   ├── wake_word.py           #   openWakeWord 封装 (hey_jarvis, ONNX)
 │   ├── vad_silero.py          #   Silero VAD 语音活动检测
 │   ├── config.py              #   配置文件
 │   ├── kws.py / main.py       #   备用/测试代码
 │   ├── run.sh                 #   启动脚本
+│   ├── systemd/               #   systemd user service 文件
+│   │   ├── r1-voice-server.service  # 服务器守护 (Restart=always)
+│   │   └── r1-watchdog.service      # watchdog 守护 (Restart=always)
 │   └── sounds/                #   状态提示音 (wake/done/thinking/error)
 │
 ├── android-app/               # R1 上运行的 Android 应用
@@ -294,9 +298,19 @@ LISTENING → (VAD 语音结束) → THINKING → (TTS 开始) → SPEAKING → 
 ## 已知问题和坑
 
 ### 1. AudioFlinger 死锁 (最严重)
-**问题**: R1 的 Android 5.1 音频 HAL 非常脆弱。创建/释放 AudioRecord 太快会导致永久死锁。
+**问题**: R1 的 Android 5.1 音频 HAL 非常脆弱。创建/释放 AudioRecord 太快会导致永久死锁。Phicomm 原生服务竞争麦克风也会触发。
 
-**解决方案**: 重启 R1 是唯一恢复手段。BootReceiver 已禁用，手动启动。
+**解决方案**: 以前只能手动断电重启 R1。现在由 **watchdog 自愈系统** 自动处理：
+- `server.py` 每 5s 将健康状态（是否连接、最后音频帧时间）写入 `/tmp/r1_server_state.json`
+- `r1_watchdog.py` 每 10s 检查该状态：
+  - **音频停滞 60s**（WS 连着但无帧）→ 判定 AudioFlinger 死锁
+  - **断开 90s** → 判定 app/WS 崩溃
+- 恢复阶梯：
+  1. **软恢复**: ADB force-stop Phicomm 服务 + 重启 app（解决 app 崩溃/竞争）
+  2. **硬恢复**: 软恢复 90s 观察期无效 → `adb reboot`（解决 AudioFlinger 死锁）
+  3. **重启后**: 等 R1 boot 完成 → 自动杀 Phicomm + 启动 app（替代手动操作）
+- 防误伤: 软恢复 120s 冷却、硬恢复 600s 冷却、1 小时内最多 2 次 reboot（防重启循环）
+- 两个服务都由 systemd 守护（`Restart=always`），开机自启（需 `loginctl enable-linger`）
 
 ### 2. adb install 挂起
 **问题**: R1 的 adbd 不兼容现代 ADB 的 streaming install 协议。`adb shell pm install` 前台执行也会断开连接。

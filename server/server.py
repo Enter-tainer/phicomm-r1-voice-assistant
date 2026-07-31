@@ -32,6 +32,36 @@ from vad_silero import SileroVAD
 from pipeline import run_pipeline
 from wake_word import WakeWordDetector
 
+# Global health state — written to /tmp/r1_server_state.json for the watchdog.
+# The watchdog (r1_watchdog.py) reads this to detect audio stalls / disconnects
+# and auto-recover the R1 (kill Phicomm services, restart app, reboot as last resort).
+_server_state = {
+    "connected": False,
+    "last_frame_time": 0.0,
+    "state": config.STATE_IDLE,
+    "pid": os.getpid(),
+    "server_time": time.time(),
+}
+
+STATE_FILE = "/tmp/r1_server_state.json"
+
+
+def _write_state_file():
+    _server_state["server_time"] = time.time()
+    _server_state["state"] = _server_state.get("state", config.STATE_IDLE)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(_server_state, f)
+    except Exception:
+        pass
+
+
+async def state_writer_loop():
+    """Periodically dump server health state for the watchdog."""
+    while True:
+        _write_state_file()
+        await asyncio.sleep(5)
+
 # Load status sound PCM files at startup
 _status_sounds = {}
 
@@ -113,6 +143,8 @@ class ClientSession:
 
 async def handle_binary(client: ClientSession, data: bytes):
     """Handle incoming PCM audio from R1."""
+    _server_state["last_frame_time"] = time.time()
+    _server_state["connected"] = True
     if not hasattr(client, '_frame_count'):
         client._frame_count = 0
     client._frame_count += 1
@@ -293,6 +325,7 @@ async def handle_client(websocket):
     """Handle a single WebSocket client connection."""
     remote = websocket.remote_address
     logger.info(f"Client connected: {remote}")
+    _server_state["connected"] = True
 
     client = ClientSession(websocket)
     logger.info(f"Session ID: {client.hermes_session_id}")
@@ -318,6 +351,7 @@ async def handle_client(websocket):
     except Exception as e:
         logger.error(f"Client handler error: {e}", exc_info=True)
     finally:
+        _server_state["connected"] = False
         # Cancel any running pipeline when client disconnects
         if client.pipeline_task and not client.pipeline_task.done():
             client.pipeline_task.cancel()
@@ -341,6 +375,7 @@ async def main():
     async with serve(handle_client, config.WS_HOST, config.WS_PORT,
                      ping_interval=None, ping_timeout=None):
         logger.info(f"✅ Listening on ws://{config.WS_HOST}:{config.WS_PORT}")
+        asyncio.create_task(state_writer_loop())
         await asyncio.Future()  # run forever
 
 

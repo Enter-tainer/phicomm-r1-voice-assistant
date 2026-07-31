@@ -1,0 +1,14 @@
+[Unit]
+Description=R1 Voice Watchdog (auto-recovery for AudioFlinger deadlocks)
+After=r1-voice-server.service
+Wants=r1-voice-server.service
+
+[Service]
+Type=simple
+ExecStart=/home/mgt/projects/r1-voice-server/.venv/bin/python /home/mgt/projects/r1-voice-server/r1_watchdog.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

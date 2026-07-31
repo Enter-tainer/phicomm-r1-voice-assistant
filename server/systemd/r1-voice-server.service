@@ -1,0 +1,15 @@
+[Unit]
+Description=R1 Voice Server (WebSocket + wake word + ASR pipeline)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mgt/projects/r1-voice-server
+ExecStart=/home/mgt/projects/r1-voice-server/.venv/bin/python server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
