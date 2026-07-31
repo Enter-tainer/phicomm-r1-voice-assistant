@@ -68,3 +68,15 @@ STATE_IDLE = "idle"
 STATE_LISTENING = "listening"
 STATE_THINKING = "thinking"
 STATE_SPEAKING = "speaking"
+
+# Session grouping: reuse the same Hermes session ID if the last interaction
+# happened within this window (minutes); otherwise start a fresh session.
+# "Interaction" = a completed voice turn (user spoke → ASR → Hermes reply).
+# This lets short reconnects (watchdog soft-recovery, WiFi blips, server
+# restart) keep conversation memory, while long idle gaps start fresh.
+SESSION_REUSE_WINDOW_MINUTES = 10
+# Where the session state (last session_id + last interaction time) persists
+# across server restarts.
+SESSION_STATE_FILE = os.path.expanduser(
+    "~/.hermes/r1_voice_session_state.json"
+)

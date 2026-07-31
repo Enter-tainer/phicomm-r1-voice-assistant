@@ -90,6 +90,64 @@ logger = logging.getLogger("r1voice.server")
 
 import uuid
 
+# --- Session grouping state (persisted across restarts) -------------------
+# "Interaction" = a completed voice turn. We reuse the last session ID when a
+# new connection arrives within SESSION_REUSE_WINDOW_MINUTES of the last
+# interaction, so short reconnects keep conversation memory; longer gaps
+# start a fresh session.
+_session_state = {
+    "session_id": None,
+    "last_interaction_time": 0.0,
+}
+
+
+def _load_session_state():
+    try:
+        with open(config.SESSION_STATE_FILE) as f:
+            data = json.load(f)
+            _session_state["session_id"] = data.get("session_id")
+            _session_state["last_interaction_time"] = data.get(
+                "last_interaction_time", 0.0
+            )
+    except Exception:
+        pass
+
+
+def _save_session_state():
+    try:
+        os.makedirs(os.path.dirname(config.SESSION_STATE_FILE), exist_ok=True)
+        with open(config.SESSION_STATE_FILE, "w") as f:
+            json.dump(_session_state, f)
+    except Exception as e:
+        logger.warning(f"Failed to save session state: {e}")
+
+
+def _pick_session_id() -> str:
+    """Reuse the last session ID if within the interaction window, else new."""
+    now = time.time()
+    window = config.SESSION_REUSE_WINDOW_MINUTES * 60
+    last = _session_state.get("last_interaction_time", 0.0)
+    old_id = _session_state.get("session_id")
+    if old_id and (now - last) <= window:
+        logger.info(
+            f"Reusing session {old_id} (last interaction "
+            f"{(now - last) / 60:.1f} min ago, window {config.SESSION_REUSE_WINDOW_MINUTES} min)"
+        )
+        return old_id
+    new_id = f"r1-voice-{uuid.uuid4().hex[:12]}"
+    logger.info(f"New session {new_id} (last interaction {(now - last) / 60:.1f} min ago)")
+    _session_state["session_id"] = new_id
+    _session_state["last_interaction_time"] = now
+    _save_session_state()
+    return new_id
+
+
+def _mark_interaction():
+    """Update last interaction time (called after a completed voice turn)."""
+    _session_state["last_interaction_time"] = time.time()
+    _save_session_state()
+
+
 class ClientSession:
     """Per-client state."""
 
@@ -99,7 +157,7 @@ class ClientSession:
         self.vad = SileroVAD()
         self.wake_word = WakeWordDetector()
         self.audio_buffer = bytearray()
-        self.hermes_session_id = f"r1-voice-{uuid.uuid4().hex[:12]}"
+        self.hermes_session_id = _pick_session_id()
         self.is_streaming_tts = False
         self.last_wake_score = 0.0
         self.wake_score_log = []
@@ -266,6 +324,8 @@ async def handle_binary(client: ClientSession, data: bytes):
                             on_status_sound=on_status_sound,
                             is_alive=lambda: client.ws_alive,
                         )
+                        # A voice turn completed — update session grouping state
+                        _mark_interaction()
                     except Exception as e:
                         logger.error(f"Pipeline crashed: {e}", exc_info=True)
                         try:
@@ -363,6 +423,7 @@ async def handle_client(websocket):
 
 async def main():
     """Start the WebSocket server."""
+    _load_session_state()
     load_status_sounds()
     logger.info(f"R1 Voice Server starting on {config.WS_HOST}:{config.WS_PORT}")
     logger.info(f"  Wake word: openWakeWord (hey_jarvis, ONNX, threshold={config.WAKE_WORD_THRESHOLD})")
