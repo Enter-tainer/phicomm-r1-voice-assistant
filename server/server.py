@@ -191,18 +191,23 @@ class ClientSession:
             self.ws_alive = False
 
     async def send_tts_chunk(self, pcm: bytes):
-        """Send a PCM chunk to client, applying dynamic backpressure.
+        """Send a PCM chunk to client with pacing + dynamic backpressure.
 
-        Uses the asyncio transport's write-buffer watermark as a closed-loop
-        flow control: if the OS/TCP send buffer is already holding more than
-        ~0.5s of audio (HIGH_WATER), we pause until it drains below the low
-        watermark. This adapts to the R1's actual consumption rate instead of
-        a fixed sleep:
-          - R1 plays fast / network is fast → buffer stays low → no waiting
-          - R1 stalls / network slows → buffer rises → we naturally slow down
-        This prevents the WS deadlock that occurred when the server pushed a
-        whole multi-second sentence back-to-back (AudioTrack buffer filled →
-        writePcm blocked the read thread → TCP backed up → WS died).
+        Two-layer flow control (2026-08-01, commit after b8da606):
+
+        1. Real-time pacing floor: each chunk is 1920 bytes = 20ms of 48kHz
+           mono audio, so we sleep ~15ms between chunks. This caps the send
+           rate at ~1.3x realtime. WITHOUT this floor, on a fast LAN the TCP
+           write buffer almost never fills (client drains it quickly), the
+           watermark check never triggers, and the server shoves a whole
+           40s answer at the R1 in a couple of seconds. The R1's small
+           playback queue (~0.25s) then overflows → chunks dropped → audio
+           sounds sped up / choppy (observed 2026-08-01).
+
+        2. Watermark backpressure (keep): if the client stalls (WiFi blip,
+           AudioTrack blocked), the OS/TCP send buffer fills past HIGH_WATER
+           and we pause until it drains below LOW_WATER. This adapts to a
+           slow consumer without a fixed assumption.
         """
         if not self.ws_alive:
             return
@@ -212,7 +217,9 @@ class ClientSession:
             logger.error(f"Failed to send TTS chunk: {e}")
             self.ws_alive = False
             return
-        # Dynamic backpressure: pause while the write buffer is above the
+        # Pacing floor: ~15ms per 20ms chunk → ≤1.33x realtime.
+        await asyncio.sleep(0.015)
+        # Watermark backpressure: pause while the write buffer is above the
         # high watermark, resume when it drains below the low watermark.
         # 96000 bytes = 1s of 48kHz 16-bit mono audio.
         HIGH_WATER = 48000   # 0.5s of audio

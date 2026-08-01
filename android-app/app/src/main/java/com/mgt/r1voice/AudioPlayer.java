@@ -38,9 +38,10 @@ public class AudioPlayer {
     private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_OUT_MONO;
     private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
 
-    // Max PCM we queue before dropping (≈0.5s). Protects against unbounded
-    // queue growth if the network outruns the speaker for a moment.
-    private static final int MAX_QUEUE_BYTES = 24000;
+    // Max PCM we queue before dropping (≈1s). Server paces TTS at ≤1.33x
+    // realtime (15ms sleep per 20ms chunk), so a ~1s queue absorbs the
+    // 0.33s/s headroom safely without ever dropping audio.
+    private static final int MAX_QUEUE_BYTES = 96000;
 
     private final Object stateLock = new Object();
     private AudioTrack audioTrack;
