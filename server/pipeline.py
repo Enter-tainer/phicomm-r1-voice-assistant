@@ -75,7 +75,6 @@ async def ask_hermes(text: str, session_id: str = None) -> str:
     Args:
         text: user's transcribed speech
         session_id: optional Hermes session ID for multi-turn context
-        conversation_history: list of {role, content} dicts for multi-turn context
 
     Returns:
         Assistant's response text
@@ -96,7 +95,11 @@ async def ask_hermes(text: str, session_id: str = None) -> str:
         "stream": False,  # We'll collect full response, then TTS
     }
 
-    # If we have a session ID, add it as a header for Hermes context
+    # If we have a session ID, add it as a header for Hermes context.
+    # NOTE: session continuation relies on the gateway's prompt cache, so we
+    # keep the request body minimal and let the gateway attach history. Do NOT
+    # build the conversation ourselves — hand-rolled messages defeat the
+    # gateway's cached prefix and slow every turn down.
     extra_headers = {}
     if session_id:
         extra_headers["X-Hermes-Session-Id"] = session_id
@@ -110,7 +113,10 @@ async def ask_hermes(text: str, session_id: str = None) -> str:
                 f"{config.HERMES_BASE}/chat/completions",
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=30),
+                # Long sessions accumulate history server-side, so response
+                # latency grows with turns (observed 118K prompt tokens →
+                # ~15-30s). Give it generous headroom (was 30s → too tight).
+                timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()

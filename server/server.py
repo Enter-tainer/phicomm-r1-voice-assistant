@@ -123,7 +123,12 @@ def _save_session_state():
 
 
 def _pick_session_id() -> str:
-    """Reuse the last session ID if within the interaction window, else new."""
+    """Reuse the last session ID if within the interaction window, else new.
+
+    The session ID groups turns that belong together (short reconnects keep
+    memory via the gateway's session history) vs fresh starts (idle gap
+    longer than SESSION_REUSE_WINDOW_MINUTES).
+    """
     now = time.time()
     window = config.SESSION_REUSE_WINDOW_MINUTES * 60
     last = _session_state.get("last_interaction_time", 0.0)
@@ -135,7 +140,9 @@ def _pick_session_id() -> str:
         )
         return old_id
     new_id = f"r1-voice-{uuid.uuid4().hex[:12]}"
-    logger.info(f"New session {new_id} (last interaction {(now - last) / 60:.1f} min ago)")
+    logger.info(
+        f"New session {new_id} (last interaction {(now - last) / 60:.1f} min ago)"
+    )
     _session_state["session_id"] = new_id
     _session_state["last_interaction_time"] = now
     _save_session_state()
