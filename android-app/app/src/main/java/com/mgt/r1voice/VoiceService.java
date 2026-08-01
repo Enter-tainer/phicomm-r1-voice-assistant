@@ -75,6 +75,7 @@ public class VoiceService extends Service {
         Log.i(TAG, "Starting voice assistant, server=" + serverAddr);
 
         audioPlayer = new AudioPlayer();
+        audioPlayer.init();  // create AudioTrack + playback thread once
 
         // Connect WebSocket
         wsClient = new WsClient(serverAddr, new WsClient.WsListener() {
@@ -219,7 +220,10 @@ public class VoiceService extends Service {
         Log.i(TAG, "VoiceService destroyed");
         isRunning = false;
         stopRecording();
-        stopPlayback();
+        if (audioPlayer != null) {
+            audioPlayer.release();  // full teardown (thread + AudioTrack)
+            audioPlayer = null;
+        }
         if (wsClient != null) {
             wsClient.disconnect();
             wsClient = null;
