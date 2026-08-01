@@ -60,8 +60,10 @@ public class AudioPlayer {
     private AckCallback ackCallback;
     private long lastAckFrames = 0;
 
-    // Report progress every ~0.5s of audio (24000 frames).
-    private static final long ACK_INTERVAL_FRAMES = 24000;
+    // Report progress every ~0.25s of audio (12000 frames). The server's
+    // in-flight window is 2s, so it needs ACKs ~4x per window; 0.25s
+    // granularity keeps the server unblocked without message spam.
+    private static final long ACK_INTERVAL_FRAMES = 12000;
 
     public void setAckCallback(AckCallback cb) {
         this.ackCallback = cb;
@@ -215,6 +217,27 @@ public class AudioPlayer {
             if (Thread.currentThread().isInterrupted()) {
                 break;
             }
+
+            // ACK playback progress to the server (closed-loop flow
+            // control) on EVERY iteration, including idle ticks when the
+            // queue is empty. CRITICAL: while the server pauses sending
+            // (in-flight window full), the playback head keeps advancing
+            // through already-written audio — if we only acked after a
+            // write(), the server would never hear back once the queue ran
+            // dry, stall 5s, dribble one chunk, and the whole TTS would
+            // crawl at ~1 chunk/5s. (Observed 2026-08-01.)
+            if (ackCallback != null && audioTrack != null) {
+                try {
+                    long frames = audioTrack.getPlaybackHeadPosition();
+                    if (frames - lastAckFrames >= ACK_INTERVAL_FRAMES) {
+                        lastAckFrames = frames;
+                        ackCallback.onPlaybackProgress(frames);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "playback head read error", e);
+                }
+            }
+
             byte[] data;
             try {
                 data = queue.poll(200, TimeUnit.MILLISECONDS);
@@ -237,20 +260,6 @@ public class AudioPlayer {
                 } catch (Exception e) {
                     Log.w(TAG, "AudioTrack.write error", e);
                     break;
-                }
-                // ACK playback progress to the server (closed-loop flow
-                // control): every ~0.5s of frames played, report the
-                // AudioTrack playback head position.
-                if (ackCallback != null) {
-                    try {
-                        long frames = audioTrack.getPlaybackHeadPosition();
-                        if (frames - lastAckFrames >= ACK_INTERVAL_FRAMES) {
-                            lastAckFrames = frames;
-                            ackCallback.onPlaybackProgress(frames);
-                        }
-                    } catch (Exception e) {
-                        Log.w(TAG, "playback head read error", e);
-                    }
                 }
             }
         }
