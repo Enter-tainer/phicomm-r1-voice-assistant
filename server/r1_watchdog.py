@@ -232,6 +232,15 @@ class Watchdog:
             return
 
         if connected:
+            # CRITICAL: during TTS playback the R1 mutes its mic (to avoid
+            # echo), so no audio frames arrive while state == "speaking".
+            # That is EXPECTED, not a stall — never reboot mid-speech.
+            # (2026-08-01: this was misdiagnosed as a deadlock and the R1 was
+            # rebooted while happily narrating a long answer.)
+            cur_state = state.get("state", "idle")
+            if cur_state == "speaking":
+                self._log_state("speaking")
+                return
             if now - last_frame > STALL_TIMEOUT:
                 self._log_state("stalled")
                 # Ladder: soft first, then hard if soft didn't help.

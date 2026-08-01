@@ -174,6 +174,11 @@ class ClientSession:
     async def send_state(self, state: str, quiet: bool = False):
         """Send state change to client and update internal state."""
         self.state = state
+        # Mirror to global health state so the watchdog can distinguish
+        # "speaking" (TTS playing → mic muted → no frames is EXPECTED) from
+        # a real audio stall. Without this the watchdog only ever saw "idle"
+        # and rebooted the R1 mid-TTS.
+        _server_state["state"] = state
         if not self.ws_alive:
             return
         msg = json.dumps({"type": "state", "state": state})
