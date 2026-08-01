@@ -230,39 +230,16 @@ async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
         duration = len(pcm_data) / config.OUTPUT_SAMPLE_RATE / 2
         logger.info(f"TTS sentence {i+1} done: {len(pcm_data)} bytes ({duration:.2f}s)")
 
-        # Stream chunks to client at real-time pace.
-        #
-        # CRITICAL (fixed 2026-08-01): without throttling, the server pushes
-        # the whole sentence (e.g. 12s of audio) to the R1 as fast as it can.
-        # The R1's AudioTrack only buffers a few KB and AudioPlayer.writePcm()
-        # blocks on the Java-WebSocket read thread when the buffer fills, so
-        # long TTS (multi-sentence replies) deadlocks the WS: TCP backs up,
-        # server send fails ("Failed to send state"), heartbeat dies.
-        #
-        # Fix: send each 20ms chunk and sleep 20ms between chunks so the
-        # send rate matches the playback rate. Short replies are barely
-        # affected; long replies no longer overflow the device.
+        # Stream chunks to client. Flow control is handled downstream by the
+        # transport write-buffer watermark (dynamic backpressure in
+        # send_tts_chunk) — it adapts to the R1's real consumption rate.
+        # (Fixed 2026-08-01: previously we pushed whole sentences back-to-back
+        # which deadlocked the R1's WS on long replies, then applied a fixed
+        # 20ms/chunk sleep as a first pass; the closed-loop watermark approach
+        # is strictly better — no waiting when the client keeps up.)
         if on_chunk:
-            chunks = chunk_pcm(pcm_data)
-            chunk_duration = (
-                config.OUTPUT_CHUNK_BYTES
-                / config.OUTPUT_SAMPLE_RATE
-                / config.OUTPUT_SAMPLE_SIZE
-                / config.OUTPUT_CHANNELS
-            )
-            on_chunk_failed = False
-            for chunk in chunks:
-                # If WS died, abort sending this sentence early
-                if on_chunk_failed:
-                    break
-                try:
-                    await on_chunk(chunk)
-                except Exception as e:
-                    logger.warning(f"TTS chunk send failed, aborting sentence: {e}")
-                    on_chunk_failed = True
-                    break
-                # Real-time pacing: sleep the duration of one chunk (20ms)
-                await asyncio.sleep(chunk_duration)
+            for chunk in chunk_pcm(pcm_data):
+                await on_chunk(chunk)
 
     logger.info(f"TTS streaming complete: {len(sentences)} sentences, {total_pcm_bytes} bytes total "
                 f"({total_pcm_bytes / config.OUTPUT_SAMPLE_RATE / 2:.2f}s), {failed_count} failed")

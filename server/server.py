@@ -179,7 +179,19 @@ class ClientSession:
             self.ws_alive = False
 
     async def send_tts_chunk(self, pcm: bytes):
-        """Send a PCM chunk to client."""
+        """Send a PCM chunk to client, applying dynamic backpressure.
+
+        Uses the asyncio transport's write-buffer watermark as a closed-loop
+        flow control: if the OS/TCP send buffer is already holding more than
+        ~0.5s of audio (HIGH_WATER), we pause until it drains below the low
+        watermark. This adapts to the R1's actual consumption rate instead of
+        a fixed sleep:
+          - R1 plays fast / network is fast → buffer stays low → no waiting
+          - R1 stalls / network slows → buffer rises → we naturally slow down
+        This prevents the WS deadlock that occurred when the server pushed a
+        whole multi-second sentence back-to-back (AudioTrack buffer filled →
+        writePcm blocked the read thread → TCP backed up → WS died).
+        """
         if not self.ws_alive:
             return
         try:
@@ -187,6 +199,22 @@ class ClientSession:
         except Exception as e:
             logger.error(f"Failed to send TTS chunk: {e}")
             self.ws_alive = False
+            return
+        # Dynamic backpressure: pause while the write buffer is above the
+        # high watermark, resume when it drains below the low watermark.
+        # 96000 bytes = 1s of 48kHz 16-bit mono audio.
+        HIGH_WATER = 48000   # 0.5s of audio
+        LOW_WATER = 9600     # 0.1s of audio
+        try:
+            transport = self.ws.transport
+            while transport.get_write_buffer_size() > HIGH_WATER:
+                await asyncio.sleep(0.01)
+                if not self.ws_alive:
+                    return
+                if transport.get_write_buffer_size() < LOW_WATER:
+                    break
+        except Exception:
+            pass  # transport may be gone on disconnect; send errors already handled
 
     async def send_json(self, data: dict):
         """Send JSON message to client."""
