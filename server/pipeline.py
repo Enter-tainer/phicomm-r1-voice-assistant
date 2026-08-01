@@ -230,10 +230,39 @@ async def synthesize_tts_stream(text: str, on_chunk=None) -> int:
         duration = len(pcm_data) / config.OUTPUT_SAMPLE_RATE / 2
         logger.info(f"TTS sentence {i+1} done: {len(pcm_data)} bytes ({duration:.2f}s)")
 
-        # Stream chunks to client immediately
+        # Stream chunks to client at real-time pace.
+        #
+        # CRITICAL (fixed 2026-08-01): without throttling, the server pushes
+        # the whole sentence (e.g. 12s of audio) to the R1 as fast as it can.
+        # The R1's AudioTrack only buffers a few KB and AudioPlayer.writePcm()
+        # blocks on the Java-WebSocket read thread when the buffer fills, so
+        # long TTS (multi-sentence replies) deadlocks the WS: TCP backs up,
+        # server send fails ("Failed to send state"), heartbeat dies.
+        #
+        # Fix: send each 20ms chunk and sleep 20ms between chunks so the
+        # send rate matches the playback rate. Short replies are barely
+        # affected; long replies no longer overflow the device.
         if on_chunk:
-            for chunk in chunk_pcm(pcm_data):
-                await on_chunk(chunk)
+            chunks = chunk_pcm(pcm_data)
+            chunk_duration = (
+                config.OUTPUT_CHUNK_BYTES
+                / config.OUTPUT_SAMPLE_RATE
+                / config.OUTPUT_SAMPLE_SIZE
+                / config.OUTPUT_CHANNELS
+            )
+            on_chunk_failed = False
+            for chunk in chunks:
+                # If WS died, abort sending this sentence early
+                if on_chunk_failed:
+                    break
+                try:
+                    await on_chunk(chunk)
+                except Exception as e:
+                    logger.warning(f"TTS chunk send failed, aborting sentence: {e}")
+                    on_chunk_failed = True
+                    break
+                # Real-time pacing: sleep the duration of one chunk (20ms)
+                await asyncio.sleep(chunk_duration)
 
     logger.info(f"TTS streaming complete: {len(sentences)} sentences, {total_pcm_bytes} bytes total "
                 f"({total_pcm_bytes / config.OUTPUT_SAMPLE_RATE / 2:.2f}s), {failed_count} failed")
