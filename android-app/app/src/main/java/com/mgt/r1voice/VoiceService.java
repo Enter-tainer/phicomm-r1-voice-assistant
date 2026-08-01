@@ -76,6 +76,16 @@ public class VoiceService extends Service {
 
         audioPlayer = new AudioPlayer();
         audioPlayer.init();  // create AudioTrack + playback thread once
+        audioPlayer.setAckCallback(new AudioPlayer.AckCallback() {
+            @Override
+            public void onPlaybackProgress(long frames) {
+                // Report playback progress so the server can apply
+                // closed-loop in-flight flow control on TTS chunks.
+                if (wsClient != null && wsClient.isConnected()) {
+                    wsClient.sendText("{\"type\":\"ack\",\"frames\":" + frames + "}");
+                }
+            }
+        });
 
         // Connect WebSocket
         wsClient = new WsClient(serverAddr, new WsClient.WsListener() {

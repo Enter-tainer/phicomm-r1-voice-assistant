@@ -51,6 +51,22 @@ public class AudioPlayer {
     private int queuedBytes = 0;
     private Thread playbackThread;
 
+    // ACK callback: reports playback progress (in 48kHz frames) so the
+    // server can apply closed-loop in-flight flow control.
+    public interface AckCallback {
+        void onPlaybackProgress(long frames);
+    }
+
+    private AckCallback ackCallback;
+    private long lastAckFrames = 0;
+
+    // Report progress every ~0.5s of audio (24000 frames).
+    private static final long ACK_INTERVAL_FRAMES = 24000;
+
+    public void setAckCallback(AckCallback cb) {
+        this.ackCallback = cb;
+    }
+
     /** Create the AudioTrack + playback thread (once). Returns true on success. */
     public boolean init() {
         synchronized (stateLock) {
@@ -149,6 +165,7 @@ public class AudioPlayer {
                 }
             }
         }
+        lastAckFrames = 0;  // playback head resets on next start()
         Log.i(TAG, "Playback stop requested");
     }
 
@@ -220,6 +237,20 @@ public class AudioPlayer {
                 } catch (Exception e) {
                     Log.w(TAG, "AudioTrack.write error", e);
                     break;
+                }
+                // ACK playback progress to the server (closed-loop flow
+                // control): every ~0.5s of frames played, report the
+                // AudioTrack playback head position.
+                if (ackCallback != null) {
+                    try {
+                        long frames = audioTrack.getPlaybackHeadPosition();
+                        if (frames - lastAckFrames >= ACK_INTERVAL_FRAMES) {
+                            lastAckFrames = frames;
+                            ackCallback.onPlaybackProgress(frames);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "playback head read error", e);
+                    }
                 }
             }
         }

@@ -170,6 +170,13 @@ class ClientSession:
         self.wake_score_log = []
         self.ws_alive = True
         self.pipeline_task = None
+        # ACK-based flow control (in-flight window). The R1 reports its
+        # AudioTrack playback progress via {"type":"ack","frames":N}; we track
+        # sent vs acked bytes and pause when in_flight exceeds the window.
+        # This is a true closed loop (vs open-loop sleep pacing).
+        self.sent_audio_bytes = 0
+        self.acked_audio_bytes = 0
+        self._ack_waiters = []
 
     async def send_state(self, state: str, quiet: bool = False):
         """Send state change to client and update internal state."""
@@ -191,23 +198,22 @@ class ClientSession:
             self.ws_alive = False
 
     async def send_tts_chunk(self, pcm: bytes):
-        """Send a PCM chunk to client with pacing + dynamic backpressure.
+        """Send a PCM chunk to client, rate-limited by an ACK in-flight window.
 
-        Two-layer flow control (2026-08-01, commit after b8da606):
+        Closed-loop flow control (2026-08-01, commit after 74d2569):
 
-        1. Real-time pacing floor: each chunk is 1920 bytes = 20ms of 48kHz
-           mono audio, so we sleep ~15ms between chunks. This caps the send
-           rate at ~1.3x realtime. WITHOUT this floor, on a fast LAN the TCP
-           write buffer almost never fills (client drains it quickly), the
-           watermark check never triggers, and the server shoves a whole
-           40s answer at the R1 in a couple of seconds. The R1's small
-           playback queue (~0.25s) then overflows → chunks dropped → audio
-           sounds sped up / choppy (observed 2026-08-01).
-
-        2. Watermark backpressure (keep): if the client stalls (WiFi blip,
-           AudioTrack blocked), the OS/TCP send buffer fills past HIGH_WATER
-           and we pause until it drains below LOW_WATER. This adapts to a
-           slow consumer without a fixed assumption.
+        The R1 ACKs playback progress ({'type':'ack','frames':N}, frames =
+        AudioTrack playback head in 48kHz frames). We keep at most
+        TTS_INFLIGHT_WINDOW_BYTES (~2s of audio) in flight — sent but not
+        yet played. When the window is full we wait for more ACKs instead of
+        sleeping a fixed amount. This is a true closed loop:
+          - R1 plays fast → ACKs arrive fast → window never fills → full speed
+          - R1 stalls → no ACKs → window fills → we pause until it drains
+        Unlike open-loop pacing (sleep 15ms/chunk), this adapts to the R1's
+        actual playback rate AND never overruns the R1's small queue.
+        (Fixed sleep was rejected again: audio can still sound sped-up if the
+        client and server clocks drift or network burstiness exceeds the
+        sleep-derived budget.)
         """
         if not self.ws_alive:
             return
@@ -217,23 +223,31 @@ class ClientSession:
             logger.error(f"Failed to send TTS chunk: {e}")
             self.ws_alive = False
             return
-        # Pacing floor: ~15ms per 20ms chunk → ≤1.33x realtime.
-        await asyncio.sleep(0.015)
-        # Watermark backpressure: pause while the write buffer is above the
-        # high watermark, resume when it drains below the low watermark.
-        # 96000 bytes = 1s of 48kHz 16-bit mono audio.
-        HIGH_WATER = 48000   # 0.5s of audio
-        LOW_WATER = 9600     # 0.1s of audio
-        try:
-            transport = self.ws.transport
-            while transport.get_write_buffer_size() > HIGH_WATER:
-                await asyncio.sleep(0.01)
-                if not self.ws_alive:
-                    return
-                if transport.get_write_buffer_size() < LOW_WATER:
-                    break
-        except Exception:
-            pass  # transport may be gone on disconnect; send errors already handled
+
+        self.sent_audio_bytes += len(pcm)
+        window = config.TTS_INFLIGHT_WINDOW_BYTES
+        # Wait while in-flight exceeds the window.
+        while self.sent_audio_bytes - self.acked_audio_bytes > window:
+            if not self.ws_alive:
+                return
+            fut = asyncio.get_running_loop().create_future()
+            self._ack_waiters.append(fut)
+            try:
+                await asyncio.wait_for(
+                    fut, timeout=config.TTS_INFLIGHT_ACK_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                # No ACK for a while: client may have stopped acking (e.g. it
+                # is a non-ack client or the WS died silently). Stop waiting
+                # so we don't hang forever; the next send will re-check.
+                logger.warning(
+                    f"TTS in-flight ack timeout: sent={self.sent_audio_bytes} "
+                    f"acked={self.acked_audio_bytes}"
+                )
+                return
+            finally:
+                if fut in self._ack_waiters:
+                    self._ack_waiters.remove(fut)
 
     async def send_json(self, data: dict):
         """Send JSON message to client."""
@@ -420,6 +434,20 @@ async def handle_text(client: ClientSession, text: str):
         logger.info("← stop event")
         client.audio_buffer.clear()
         await client.send_state(config.STATE_IDLE)
+
+    elif msg_type == "ack":
+        # R1 playback progress: {"type":"ack","frames":N} — N = AudioTrack
+        # playback head position in 48kHz frames (mono 16-bit → ×2 bytes).
+        frames = msg.get("frames", 0)
+        if frames > 0:
+            acked = frames * 2  # 2 bytes per frame (16-bit mono)
+            if acked > client.acked_audio_bytes:
+                client.acked_audio_bytes = acked
+                # Wake any send_tts_chunk waiters whose window just freed up.
+                for fut in client._ack_waiters:
+                    if not fut.done():
+                        fut.set_result(True)
+                client._ack_waiters.clear()
 
     elif msg_type == "bye":
         logger.info("← bye event")

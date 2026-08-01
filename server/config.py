@@ -80,3 +80,15 @@ SESSION_REUSE_WINDOW_MINUTES = 10
 SESSION_STATE_FILE = os.path.expanduser(
     "~/.hermes/r1_voice_session_state.json"
 )
+
+# TTS in-flight flow control (ACK-based closed loop).
+# Maximum audio bytes sent but not yet acknowledged by the R1's playback
+# head. ~2s of audio (96KB/s × 2s = 192KB). The R1 ACKs progress with
+# {"type":"ack","frames":N}; the server pauses sending when in-flight
+# exceeds this window, resuming as ACKs arrive. This is the correct
+# backpressure: it adapts to the R1's real playback rate (vs open-loop
+# sleep pacing which can still sound sped-up on clock drift / bursts).
+TTS_INFLIGHT_WINDOW_BYTES = 192000  # 2s of 48kHz 16-bit mono
+# If no ACK arrives within this long, stop waiting (non-ack client or dead
+# WS) so a single send never hangs the pipeline forever.
+TTS_INFLIGHT_ACK_TIMEOUT = 5.0
