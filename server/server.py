@@ -197,8 +197,15 @@ class ClientSession:
             logger.error(f"Failed to send state: {e}")
             self.ws_alive = False
 
-    async def send_tts_chunk(self, pcm: bytes):
+    async def send_tts_chunk(self, pcm: bytes, flow_control: bool = True):
         """Send a PCM chunk to client, rate-limited by an ACK in-flight window.
+
+        flow_control=False is for SHORT status sounds (wake beep, thinking
+        beep, done beep, error sound — 0.15s to 2.5s). These must NOT wait
+        on the ACK window: after a TTS finishes, the R1's playback head
+        stops advancing (no more queued audio), so in-flight would never
+        drain and a beep would stall ~5s per chunk (a 0.15s beep took 40s
+        to play — observed 2026-08-02). Beeps are tiny; just send them.
 
         Closed-loop flow control (2026-08-01, commit after 74d2569):
 
@@ -211,9 +218,6 @@ class ClientSession:
           - R1 stalls → no ACKs → window fills → we pause until it drains
         Unlike open-loop pacing (sleep 15ms/chunk), this adapts to the R1's
         actual playback rate AND never overruns the R1's small queue.
-        (Fixed sleep was rejected again: audio can still sound sped-up if the
-        client and server clocks drift or network burstiness exceeds the
-        sleep-derived budget.)
         """
         if not self.ws_alive:
             return
@@ -222,6 +226,9 @@ class ClientSession:
         except Exception as e:
             logger.error(f"Failed to send TTS chunk: {e}")
             self.ws_alive = False
+            return
+
+        if not flow_control:
             return
 
         self.sent_audio_bytes += len(pcm)
@@ -297,12 +304,12 @@ async def handle_binary(client: ClientSession, data: bytes):
             logger.info(f"🔥 Wake word detected! score={score:.4f}")
             client.wake_word.reset()
 
-            # Play wake beep
+            # Play wake beep (no flow control — tiny, must not wait on ACK)
             pcm = _status_sounds.get("wake")
             if pcm:
                 from pipeline import chunk_pcm
                 for chunk in chunk_pcm(pcm, config.OUTPUT_CHUNK_BYTES):
-                    await client.send_tts_chunk(chunk)
+                    await client.send_tts_chunk(chunk, flow_control=False)
                 logger.info("Played wake beep")
 
                 # Wait for beep to finish playing on device before starting VAD.
@@ -364,7 +371,8 @@ async def handle_binary(client: ClientSession, data: bytes):
                     if pcm:
                         from pipeline import chunk_pcm
                         for chunk in chunk_pcm(pcm, config.OUTPUT_CHUNK_BYTES):
-                            await client.send_tts_chunk(chunk)
+                            # Status sounds are short; never wait on ACK window.
+                            await client.send_tts_chunk(chunk, flow_control=False)
                         logger.info(f"Played status sound: {name}")
 
                 # Launch pipeline as a background task so the message loop
@@ -407,7 +415,7 @@ async def handle_binary(client: ClientSession, data: bytes):
                 if pcm:
                     from pipeline import chunk_pcm
                     for chunk in chunk_pcm(pcm, config.OUTPUT_CHUNK_BYTES):
-                        await client.send_tts_chunk(chunk)
+                        await client.send_tts_chunk(chunk, flow_control=False)
                 await client.send_json({"type": "tts_done"})
                 await client.send_state(config.STATE_IDLE)
 
