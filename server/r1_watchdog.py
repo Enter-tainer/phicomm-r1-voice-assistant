@@ -148,9 +148,11 @@ class Watchdog:
     def __init__(self):
         self.last_soft = 0.0
         self.last_hard = 0.0
-        self.reboot_times = []   # timestamps of reboots within window
         self.start_ts = time.time()
-        self.state = "initial"
+        self.reboot_times = []
+        self.prev_state = "idle"
+        self.state = "unknown"  # for _log_state change detection
+        logger.info("watchdog started")
         self.last_state_log = 0.0
 
     def _log_state(self, new_state: str):
@@ -240,7 +242,23 @@ class Watchdog:
             cur_state = state.get("state", "idle")
             if cur_state == "speaking":
                 self._log_state("speaking")
+                self.prev_state = "speaking"
                 return
+
+            # TTS just finished (speaking → idle): the R1 needs a moment to
+            # unmute its mic and resume streaming frames. The stall counter
+            # is based on last_frame_time, which has been frozen for the whole
+            # narration (54s of speech → only ~6s of slack left). Reset the
+            # clock so the R1 gets a FULL stall window to resume — otherwise
+            # the watchdog reboots it right after every long answer.
+            if self.prev_state == "speaking":
+                logger.info(
+                    f"TTS finished (speaking→idle), resetting stall timer: "
+                    f"frame age was {now - last_frame:.0f}s"
+                )
+                last_frame = now
+            self.prev_state = cur_state
+
             if now - last_frame > STALL_TIMEOUT:
                 self._log_state("stalled")
                 # Ladder: soft first, then hard if soft didn't help.
