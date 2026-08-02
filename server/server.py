@@ -244,13 +244,20 @@ class ClientSession:
                     fut, timeout=config.TTS_INFLIGHT_ACK_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                # No ACK for a while: client may have stopped acking (e.g. it
-                # is a non-ack client or the WS died silently). Stop waiting
-                # so we don't hang forever; the next send will re-check.
+                # CRITICAL (2026-08-02): if we just return here, the caller
+                # sends ONE more chunk, hits the full window again, waits 5s,
+                # sends one more... a starvation loop. The R1's AudioTrack
+                # underruns (no data), the playback head freezes, so it never
+                # ACKs and we starve it forever — user hears audio in 20ms
+                # chunks every 5s. Instead, reset the flow window so the
+                # next chunks keep flowing (degraded, TCP write buffer is the
+                # last-resort backstop). ACK-based flow control resumes the
+                # moment the R1's playback head starts advancing again.
                 logger.warning(
-                    f"TTS in-flight ack timeout: sent={self.sent_audio_bytes} "
-                    f"acked={self.acked_audio_bytes}"
+                    f"TTS ack stalled, resetting flow window: "
+                    f"sent={self.sent_audio_bytes} acked={self.acked_audio_bytes}"
                 )
+                self.sent_audio_bytes = self.acked_audio_bytes
                 return
             finally:
                 if fut in self._ack_waiters:

@@ -59,6 +59,14 @@ public class AudioPlayer {
 
     private AckCallback ackCallback;
     private long lastAckFrames = 0;
+    // Total frames written to the AudioTrack. ACKs are based on THIS, not on
+    // getPlaybackHeadPosition(): the playback head FREEZES when the queue
+    // runs dry / underruns (R1, Android 5.1) — frames - lastAckFrames then
+    // never reaches the interval and the server never gets ACKs → it stalls
+    // and starves the R1 (heard as audio in 20ms chunks every 5s). The
+    // AudioTrack buffer is tiny (~12KB ≈ 0.13s), so written ≈ played; the
+    // server's 2s in-flight window absorbs the tiny skew.
+    private long writtenFrames = 0;
 
     // Report progress every ~0.25s of audio (12000 frames). The server's
     // in-flight window is 2s, so it needs ACKs ~4x per window; 0.25s
@@ -167,7 +175,7 @@ public class AudioPlayer {
                 }
             }
         }
-        lastAckFrames = 0;  // playback head resets on next start()
+        lastAckFrames = writtenFrames;  // skip immediate ACK on next start
         Log.i(TAG, "Playback stop requested");
     }
 
@@ -220,21 +228,14 @@ public class AudioPlayer {
 
             // ACK playback progress to the server (closed-loop flow
             // control) on EVERY iteration, including idle ticks when the
-            // queue is empty. CRITICAL: while the server pauses sending
-            // (in-flight window full), the playback head keeps advancing
-            // through already-written audio — if we only acked after a
-            // write(), the server would never hear back once the queue ran
-            // dry, stall 5s, dribble one chunk, and the whole TTS would
-            // crawl at ~1 chunk/5s. (Observed 2026-08-01.)
-            if (ackCallback != null && audioTrack != null) {
-                try {
-                    long frames = audioTrack.getPlaybackHeadPosition();
-                    if (frames - lastAckFrames >= ACK_INTERVAL_FRAMES) {
-                        lastAckFrames = frames;
-                        ackCallback.onPlaybackProgress(frames);
-                    }
-                } catch (Exception e) {
-                    Log.w(TAG, "playback head read error", e);
+            // queue is empty. Based on writtenFrames (cumulative bytes
+            // handed to the AudioTrack), NOT getPlaybackHeadPosition()
+            // which freezes on underrun/empty queue — see field comment.
+            if (ackCallback != null) {
+                long frames = writtenFrames;
+                if (frames - lastAckFrames >= ACK_INTERVAL_FRAMES) {
+                    lastAckFrames = frames;
+                    ackCallback.onPlaybackProgress(frames);
                 }
             }
 
@@ -257,6 +258,7 @@ public class AudioPlayer {
             if (audioTrack != null) {
                 try {
                     audioTrack.write(data, 0, data.length);
+                    writtenFrames += data.length / 2;  // 16-bit mono
                 } catch (Exception e) {
                     Log.w(TAG, "AudioTrack.write error", e);
                     break;
