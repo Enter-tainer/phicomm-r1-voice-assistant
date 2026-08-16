@@ -52,7 +52,11 @@ OUTPUT_CHUNK_BYTES = OUTPUT_SAMPLE_RATE * OUTPUT_SAMPLE_SIZE * OUTPUT_CHANNELS *
 
 # Wake word (openWakeWord, server-side)
 WAKE_WORD_MODEL = "hey_jarvis"
-WAKE_WORD_THRESHOLD = 0.8  # Normal "Hey Jarvis" scores ~0.96; lower scores = software issue (crash/deadlock), not missed wake word
+# 0.95 since 2026-08-16: all recent triggers were TV/ambient false positives
+# (scores 0.89-0.9973 — TV literally says "jarvis"). 0.95 blocks the 0.89-0.94
+# class; note real wake words have been observed as low as 0.9286, so some
+# missed wakes are accepted. Cannot block 0.99+ TV triggers (same word acoustically).
+WAKE_WORD_THRESHOLD = 0.95
 
 # Mic gain — R1 microphone sensitivity is very low (raw audio ~100-200 when speaking)
 # Apply gain to bring it to normal levels (~3000-10000)
